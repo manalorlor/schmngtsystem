@@ -1,126 +1,169 @@
-import { createContext, useContext, useState } from 'react'
+import { createContext, useContext, useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 
 const AuthContext = createContext(null)
 
-// Demo accounts for development (remove when Supabase auth is live)
-const DEMO_ACCOUNTS = {
-  'admin@manatech.edu': { role: 'admin', name: 'Mr. Isaac Asante', password: 'admin123' },
-  'teacher@manatech.edu': { role: 'teacher', name: 'Mr. Emmanuel Adjei', password: 'teacher123' },
-  'student@manatech.edu': { role: 'student', name: 'Kofi Mensah', password: 'student123' },
-}
-
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(() => {
-    const saved = localStorage.getItem('sf_user')
-    if (saved) {
-      try { return JSON.parse(saved) } catch (e) { console.error(e) }
+  const [user, setUser] = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  async function loadUserProfile(authUser) {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('id, name, role, school_id, avatar_url, phone')
+      .eq('id', authUser.id)
+      .single()
+
+    if (profile) {
+      setUser({
+        id: authUser.id,
+        email: authUser.email,
+        name: profile.name,
+        role: profile.role,
+        schoolId: profile.school_id,
+        avatarUrl: profile.avatar_url,
+        phone: profile.phone,
+      })
     }
-    return null
-  })
-
-  // Local state for registered users (useful for demo/offline mode)
-  const [users, setUsers] = useState(() => {
-    const saved = localStorage.getItem('sf_users')
-    return saved ? JSON.parse(saved) : DEMO_ACCOUNTS
-  })
-
-  const [loading] = useState(false)
-
-  const login = async (email, password) => {
-    const account = users[email.toLowerCase()]
-    if (account && account.password === password) {
-      const userData = { email, role: account.role, name: account.name, id: `user-${Date.now()}` }
-      setUser(userData)
-      localStorage.setItem('sf_user', JSON.stringify(userData))
-      return { data: userData, error: null }
-    }
-
-    if (import.meta.env.VITE_SUPABASE_URL) {
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-      if (error) return { data: null, error }
-      const profile = data.user?.user_metadata || {}
-      const userData = { email, role: profile.role || 'student', name: profile.name || email, id: data.user.id }
-      setUser(userData)
-      localStorage.setItem('sf_user', JSON.stringify(userData))
-      return { data: userData, error: null }
-    }
-
-    return { data: null, error: { message: 'Invalid email or password.' } }
   }
 
-  const signup = async (email, password, name, role) => {
-    const lowerEmail = email.toLowerCase()
-    if (users[lowerEmail]) {
-      return { data: null, error: { message: 'User already exists.' } }
-    }
-    
-    const newUser = { role, name, password }
-    const updatedUsers = { ...users, [lowerEmail]: newUser }
-    setUsers(updatedUsers)
-    localStorage.setItem('sf_users', JSON.stringify(updatedUsers))
-    
-    return { data: newUser, error: null }
-  }
-
-  const updateUserRole = (email, newRole) => {
-    const lowerEmail = email.toLowerCase()
-    if (users[lowerEmail]) {
-      const updatedUsers = { ...users, [lowerEmail]: { ...users[lowerEmail], role: newRole } }
-      setUsers(updatedUsers)
-      localStorage.setItem('sf_users', JSON.stringify(updatedUsers))
-      return true
-    }
-    return false
-  }
-
-  const updateUserProfile = (updates) => {
-    // Update active user session
-    const updatedUser = { ...user, ...updates }
-    setUser(updatedUser)
-    localStorage.setItem('sf_user', JSON.stringify(updatedUser))
-
-    // If changing password or details, update the demo account store too
-    const lowerEmail = user.email.toLowerCase()
-    if (users[lowerEmail]) {
-      const updatedUsers = { 
-        ...users, 
-        [lowerEmail]: { ...users[lowerEmail], ...updates } 
+  // On mount, restore session from Supabase and fetch profile
+  useEffect(() => {
+    const restoreSession = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (session?.user) {
+        await loadUserProfile(session.user)
       }
-      setUsers(updatedUsers)
-      localStorage.setItem('sf_users', JSON.stringify(updatedUsers))
+      setLoading(false)
     }
+    restoreSession()
+
+    // Listen for auth changes (login, logout, token refresh)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (session?.user) {
+        await loadUserProfile(session.user)
+      } else {
+        setUser(null)
+      }
+    })
+    return () => subscription.unsubscribe()
+  }, [])
+
+  // ── LOGIN ──
+  const login = async (email, password) => {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+    if (error) return { data: null, error }
+    
+    // Explicitly load the profile and wait for it
+    if (data?.user) {
+      await loadUserProfile(data.user)
+    }
+    
+    return { data, error: null }
+  }
+
+  // ── TEACHER SIGNUP (called from LoginPage after OTP verified) ──
+  const signup = async (email, password, name, role, schoolId) => {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { name, role, school_id: schoolId },
+        emailRedirectTo: window.location.origin + '/login',
+      },
+    })
+    if (error) return { data: null, error }
+
+    // If email confirmation is disabled in Supabase, insert profile immediately
+    if (data.user && !data.user.identities?.length === 0) {
+      await supabase.from('profiles').upsert({
+        id: data.user.id,
+        school_id: schoolId,
+        name,
+        role,
+      })
+    }
+
+    return { data, error: null }
+  }
+
+  // ── ADMIN SCHOOL REGISTRATION (called from RegisterSchool after payment) ──
+  const registerSchoolAdmin = async ({ email, password, name, schoolId }) => {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { name, role: 'admin', school_id: schoolId },
+        emailRedirectTo: window.location.origin + '/login',
+      },
+    })
+    if (error) return { data: null, error }
+    return { data, error: null }
+  }
+
+  // ── UPDATE OWN PROFILE ──
+  const updateUserProfile = async (updates) => {
+    if (!user) return false
+    const { error } = await supabase
+      .from('profiles')
+      .update({
+        name: updates.name,
+        phone: updates.phone,
+        avatar_url: updates.avatarUrl,
+      })
+      .eq('id', user.id)
+
+    if (error) return false
+    setUser(prev => ({ ...prev, ...updates }))
     return true
   }
 
-  const resetPassword = (email, newPassword) => {
-    const lowerEmail = email.toLowerCase()
-    if (users[lowerEmail]) {
-      const updatedUsers = { 
-        ...users, 
-        [lowerEmail]: { ...users[lowerEmail], password: newPassword } 
-      }
-      setUsers(updatedUsers)
-      localStorage.setItem('sf_users', JSON.stringify(updatedUsers))
-      return true
-    }
-    return false
+  // ── CHANGE PASSWORD (from Settings page) ──
+  const resetPassword = async (email, newPassword) => {
+    const { error } = await supabase.auth.updateUser({ password: newPassword })
+    if (error) return false
+    return true
   }
 
+  // ── SEND PASSWORD RESET EMAIL ──
+  const sendPasswordResetEmail = async (email) => {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin + '/login?view=forgot_new_pwd',
+    })
+    if (error) return { error }
+    return { error: null }
+  }
+
+  // ── LOGOUT ──
   const logout = async () => {
-    if (import.meta.env.VITE_SUPABASE_URL) {
+    try {
       await supabase.auth.signOut()
+    } catch (e) {
+      console.error('Logout error:', e)
+    } finally {
+      setUser(null)
+      localStorage.removeItem('sf_user')
+      localStorage.removeItem('sf_school')
     }
-    setUser(null)
-    localStorage.removeItem('sf_user')
   }
 
   return (
-    <AuthContext.Provider value={{ user, users, loading, login, signup, updateUserRole, updateUserProfile, resetPassword, logout }}>
+    <AuthContext.Provider value={{
+      user,
+      loading,
+      login,
+      signup,
+      registerSchoolAdmin,
+      updateUserProfile,
+      resetPassword,
+      sendPasswordResetEmail,
+      logout,
+    }}>
       {children}
     </AuthContext.Provider>
   )
 }
+
 // eslint-disable-next-line react-refresh/only-export-components
 export function useAuth() {
   const ctx = useContext(AuthContext)

@@ -38,8 +38,7 @@ const PLANS = [
 
 export default function RegisterSchool() {
   const navigate = useNavigate()
-  const { updateSchoolInfo, activateSchool } = useData()
-  const { signup } = useAuth()
+  const { registerSchoolAdmin } = useAuth()
   const [step, setStep] = useState(1) // 1=school, 2=admin, 3=payment, 4=success
   const [form, setForm] = useState({ name: '', motto: '', address: '', logo: null, adminName: '', adminEmail: '', adminPassword: '' })
   const [preview, setPreview] = useState(null)
@@ -124,21 +123,49 @@ export default function RegisterSchool() {
     setPaying(true)
     setError(null)
 
-    // Create admin account
-    const res = await signup(form.adminEmail, form.adminPassword, form.adminName, 'admin')
-    if (res.error) {
-      setError(res.error.message)
+    // 1. Generate a unique school code
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    let schoolCode = 'SCH-'
+    for (let i = 0; i < 4; i++) schoolCode += chars[Math.floor(Math.random() * chars.length)]
+
+    // 2. Create the school using a security-definer RPC (bypasses RLS for unauthenticated users)
+    const { supabase } = await import('../../lib/supabase')
+    const { data: schoolRows, error: schoolError } = await supabase.rpc('create_school', {
+      p_name: form.name,
+      p_motto: form.motto || '',
+      p_address: form.address || '',
+      p_school_code: schoolCode,
+      p_plan: selectedPlan,
+    })
+
+    if (schoolError || !schoolRows?.length) {
+      setError('Failed to create school: ' + (schoolError?.message || 'Unknown error'))
       setPaying(false)
       return
     }
 
-    // Simulate payment processing
-    await new Promise(r => setTimeout(r, 2000))
+    const school = schoolRows[0]
 
-    // Save school info and activate
-    const savedInfo = updateSchoolInfo({ name: form.name, motto: form.motto, address: form.address, logo: form.logo, plan: selectedPlan })
-    activateSchool()
-    setGeneratedCode(savedInfo.schoolCode)
+    // 3. Create the admin user account linked to this school
+    const res = await registerSchoolAdmin({
+      email: form.adminEmail,
+      password: form.adminPassword,
+      name: form.adminName,
+      schoolId: school.id,
+    })
+
+    if (res.error) {
+      // Rollback: delete the school record if admin creation failed
+      await supabase.from('schools').delete().eq('id', school.id)
+      setError('Failed to create admin account: ' + res.error.message)
+      setPaying(false)
+      return
+    }
+
+    // 4. Simulate payment processing
+    await new Promise(r => setTimeout(r, 1500))
+
+    setGeneratedCode(school.school_code)
     setPaying(false)
     setStep(4)
   }

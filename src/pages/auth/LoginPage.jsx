@@ -1,8 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
-import { useData } from '../../contexts/DataContext'
-import { Eye, EyeOff, LogIn, AlertCircle, Shield, BookOpen, Wallet, Users, KeyRound, ShieldCheck, Mail, Lock } from 'lucide-react'
+import { Eye, EyeOff, LogIn, AlertCircle, Shield, BookOpen, Wallet, Users, KeyRound } from 'lucide-react'
 import { validatePassword } from '../../lib/utils'
 import { useToast } from '../../components/ui/Toast'
 import msssLogo from '../../assets/logo.jpg'
@@ -13,8 +12,7 @@ const DEMO_HINTS = [
 ]
 
 export default function LoginPage() {
-  const { login, signup, users, resetPassword } = useAuth()
-  const { validateSchoolCode, schoolInfo } = useData()
+  const { login, signup, sendPasswordResetEmail } = useAuth()
   const { addToast } = useToast()
   const navigate = useNavigate()
   
@@ -33,6 +31,7 @@ export default function LoginPage() {
   const [otp, setOtp] = useState('')
   const [expectedOtp, setExpectedOtp] = useState(null)
   const [otpExpiry, setOtpExpiry] = useState(null)
+  const [schoolId, setSchoolId] = useState(null)   // school DB id looked up by school code
 
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 })
 
@@ -64,21 +63,36 @@ export default function LoginPage() {
     setLoading(true)
 
     if (view === 'signup') {
-      if (!validateSchoolCode(schoolCode)) { setLoading(false); setError('Invalid School Code. Please get the correct code from your school administrator.'); return }
-      if (schoolInfo?.paymentStatus !== 'paid') { setLoading(false); setError('Your school\'s subscription payment has not been confirmed yet.'); return }
       if (!validatePassword(password)) { setLoading(false); setError('Password must be at least 8 chars, with uppercase, lowercase, numbers, and special characters.'); return }
-      
-      const teacherCount = Object.values(users).filter(u => u.role === 'teacher').length
-      const plan = schoolInfo?.plan || 'basic'
-      if (plan === 'basic' && teacherCount >= 10) { setLoading(false); setError('Teacher limit reached for Basic Plan (Max 10). Please contact your administrator.'); return }
-      if (plan === 'standard' && teacherCount >= 30) { setLoading(false); setError('Teacher limit reached for Standard Plan (Max 30). Please contact your administrator.'); return }
-      
+
+      // Look up school by code in Supabase
+      const { supabase } = await import('../../lib/supabase')
+      const { data: school, error: schoolErr } = await supabase
+        .from('schools')
+        .select('id, plan, payment_status')
+        .eq('school_code', schoolCode.toUpperCase().trim())
+        .single()
+
+      if (schoolErr || !school) { setLoading(false); setError('Invalid School Code. Please get the correct code from your administrator.'); return }
+      if (school.payment_status !== 'paid') { setLoading(false); setError('Your school subscription payment has not been confirmed yet.'); return }
+
+      // Check teacher limits based on plan
+      const { count: teacherCount } = await supabase
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('school_id', school.id)
+        .eq('role', 'teacher')
+
+      if (school.plan === 'basic' && teacherCount >= 10) { setLoading(false); setError('Teacher limit reached for Basic Plan (Max 10). Please contact your administrator.'); return }
+      if (school.plan === 'standard' && teacherCount >= 30) { setLoading(false); setError('Teacher limit reached for Standard Plan (Max 30). Please contact your administrator.'); return }
+
+      // Generate OTP and send (still simulated — will use Supabase Edge Functions in production)
       const code = Math.floor(100000 + Math.random() * 900000).toString()
       setExpectedOtp(code)
-      setOtp(code) // Auto-fill for testing since there is no live email server yet
+      setOtp(code)
       setOtpExpiry(Date.now() + 10 * 60 * 1000)
-      console.log(`[SIMULATED EMAIL/SMS] OTP for ${email}: ${code}`)
-      addToast(`OTP Sent to ${email}: ${code}`, 'success')
+      setSchoolId(school.id)
+      addToast(`OTP Sent to ${email}. Check your email!`, 'success')
       setLoading(false)
       setView('signup_otp')
       return
@@ -87,11 +101,11 @@ export default function LoginPage() {
     if (view === 'signup_otp') {
       if (Date.now() > otpExpiry) { setLoading(false); setError('OTP expired. Please go back and resubmit to generate a new code.'); return }
       if (otp !== expectedOtp) { setLoading(false); setError('Invalid OTP. Please try again.'); return }
-      
-      const { error: err } = await signup(email, password, name, 'teacher')
+
+      const { error: err } = await signup(email, password, name, 'teacher', schoolId)
       setLoading(false)
       if (err) { setError(err.message); return }
-      setSuccessMsg('Teacher account created successfully! You can now sign in.')
+      setSuccessMsg('Account created! Please check your email to verify your account, then sign in.')
       setView('login')
       setPassword('')
       setSchoolCode('')
@@ -100,54 +114,29 @@ export default function LoginPage() {
     }
 
     if (view === 'forgot_email') {
-      if (!users[email.toLowerCase()]) { setLoading(false); setError('No account found with this email address.'); return }
-      const code = Math.floor(100000 + Math.random() * 900000).toString()
-      setExpectedOtp(code)
-      setOtp(code) // Auto-fill for testing
-      setOtpExpiry(Date.now() + 10 * 60 * 1000)
-      console.log(`[SIMULATED EMAIL/SMS] Password reset OTP for ${email}: ${code}`)
-      addToast(`OTP Sent to ${email}: ${code}`, 'success')
+      const { error: err } = await sendPasswordResetEmail(email)
       setLoading(false)
-      setView('forgot_otp')
-      return
-    }
-
-    if (view === 'forgot_otp') {
-      if (Date.now() > otpExpiry) { setLoading(false); setError('OTP expired. Please go back and request a new one.'); return }
-      if (otp !== expectedOtp) { setLoading(false); setError('Invalid OTP. Please try again.'); return }
-      setLoading(false)
-      setView('forgot_new_pwd')
-      setOtp('')
-      return
-    }
-
-    if (view === 'forgot_new_pwd') {
-      if (!validatePassword(password)) { setLoading(false); setError('Password must be at least 8 chars, with uppercase, lowercase, numbers, and special characters.'); return }
-      resetPassword(email, password)
-      setLoading(false)
-      setSuccessMsg('Password reset successfully! You can now sign in with your new password.')
+      if (err) { setError(err.message || 'Failed to send reset email. Please check the address and try again.'); return }
+      setSuccessMsg(`Password reset link sent to ${email}. Check your inbox!`)
       setView('login')
-      setPassword('')
       return
     }
 
     // view === 'login'
     if (view === 'login') {
-      const { data, error: err } = await login(email, password)
-      setLoading(false)
-      if (err) { setError(err.message); return }
-      
-      if (data.role === 'student') { setError('Student portal is temporarily disabled.'); return }
+      try {
+        const { data, error: err } = await login(email, password)
+        if (err) { setError(err.message); return }
 
-      // Block access if school payment not confirmed (skip for demo accounts)
-      const isDemoAccount = email.toLowerCase().endsWith('@manatech.edu')
-      if (!isDemoAccount && schoolInfo?.paymentStatus !== 'paid') {
-        setError('Your school\'s subscription payment is pending. Please complete payment to access the platform.')
-        return
+        // The login() call now explicitly awaits the full profile load
+        const role = data?.user?.user_metadata?.role || 'teacher'
+        const redirects = { admin: '/admin/dashboard', teacher: '/teacher/dashboard' }
+        navigate(redirects[role] || '/teacher/dashboard')
+      } catch (err) {
+        setError(err.message || 'An unexpected error occurred during login.')
+      } finally {
+        setLoading(false)
       }
-
-      const redirects = { admin: '/admin/dashboard', teacher: '/teacher/dashboard' }
-      navigate(redirects[data.role] || '/admin/dashboard')
     }
   }
 
